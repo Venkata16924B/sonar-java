@@ -59,6 +59,7 @@ import org.sonar.plugins.java.api.JavaFileScannerContext;
 import org.sonar.plugins.java.api.JavaVersion;
 import org.sonar.plugins.java.api.tree.CompilationUnitTree;
 import org.sonar.plugins.java.api.tree.SyntaxToken;
+import org.sonar.plugins.java.api.tree.SyntaxTrivia;
 import org.sonar.plugins.java.api.tree.Tree;
 
 public class VisitorsBridge {
@@ -140,8 +141,12 @@ public class VisitorsBridge {
   }
 
   private void runScanner(JavaFileScannerContext javaFileScannerContext, JavaFileScanner scanner, AnalysisError.Kind kind) {
+    runScanner(() -> scanner.scanFile(javaFileScannerContext), scanner, kind);
+  }
+
+  private void runScanner(Runnable action, JavaFileScanner scanner, AnalysisError.Kind kind) {
     try {
-      scanner.scanFile(javaFileScannerContext);
+      action.run();
     } catch (IllegalRuleParameterException e) {
       // bad configuration of a rule parameter, we want to fail analysis fast.
       throw e;
@@ -153,17 +158,20 @@ public class VisitorsBridge {
       if (rootCause instanceof InterruptedIOException || rootCause instanceof InterruptedException) {
         throw e;
       }
-      Rule annotation = AnnotationUtils.getAnnotation(scanner.getClass(), Rule.class);
-      String key = "";
-      if (annotation != null) {
-        key = annotation.key();
-      }
       LOG.error(
         String.format("Unable to run check %s - %s on file '%s', To help improve SonarJava, please report this problem to SonarSource : see https://www.sonarqube.org/community/",
-          scanner.getClass(), key, currentFile),
+          scanner.getClass(), ruleKey(scanner), currentFile),
         e);
       addAnalysisError(e, currentFile, kind);
     }
+  }
+
+  private static String ruleKey(JavaFileScanner scanner) {
+    Rule annotation = AnnotationUtils.getAnnotation(scanner.getClass(), Rule.class);
+    if (annotation != null) {
+      return annotation.key();
+    }
+    return "";
   }
 
   private void addAnalysisError(Exception e, InputFile inputFile, AnalysisError.Kind checkError) {
@@ -230,7 +238,7 @@ public class VisitorsBridge {
     classLoader.close();
   }
 
-  private static class ScannerRunner {
+  private class ScannerRunner {
     private EnumMap<Tree.Kind, List<SubscriptionVisitor>> checks;
     private List<SubscriptionVisitor> subscriptionVisitors;
 
@@ -262,26 +270,35 @@ public class VisitorsBridge {
     }
 
     private void visit(Tree tree) {
+      List<SubscriptionVisitor> subscribed = checks.getOrDefault(tree.kind(), Collections.emptyList());
+
       Consumer<SubscriptionVisitor> callback;
       boolean isToken = tree.kind() == Tree.Kind.TOKEN;
       if (isToken) {
-        callback = s -> {
-          SyntaxToken syntaxToken = (SyntaxToken) tree;
-          s.visitToken(syntaxToken);
-        };
+        callback = s -> s.visitToken((SyntaxToken) tree);
       } else {
         callback = s -> s.visitNode(tree);
       }
-      List<SubscriptionVisitor> subscribed = checks.getOrDefault(tree.kind(), Collections.emptyList());
-      subscribed.forEach(callback);
+      for (SubscriptionVisitor visitor : subscribed) {
+        runSubscriptionVisitor(() -> callback.accept(visitor), visitor);
+      }
       if (isToken) {
-        checks.getOrDefault(Tree.Kind.TRIVIA, Collections.emptyList()).forEach(s -> ((SyntaxToken) tree).trivias().forEach(s::visitTrivia));
+        List<SyntaxTrivia> trivias = ((SyntaxToken) tree).trivias();
+        for (SubscriptionVisitor visitor : checks.getOrDefault(Tree.Kind.TRIVIA, Collections.emptyList())) {
+          runSubscriptionVisitor(() -> trivias.forEach(visitor::visitTrivia), visitor);
+        }
       } else {
         visitChildren(tree);
       }
       if(!isToken) {
-        subscribed.forEach(s -> s.leaveNode(tree));
+        for (SubscriptionVisitor visitor : subscribed) {
+          runSubscriptionVisitor(() -> visitor.leaveNode(tree), visitor);
+        }
       }
+    }
+
+    private void runSubscriptionVisitor(Runnable callback, SubscriptionVisitor visitor) {
+      runScanner(callback, visitor, AnalysisError.Kind.CHECK_ERROR);
     }
   }
 }

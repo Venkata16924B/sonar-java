@@ -22,6 +22,8 @@ package org.sonar.java.model;
 import java.io.File;
 import java.text.DecimalFormat;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.function.IntFunction;
@@ -38,10 +40,13 @@ import org.sonar.api.utils.log.LogTester;
 import org.sonar.api.utils.log.LoggerLevel;
 import org.sonar.java.SonarComponents;
 import org.sonar.java.TestUtils;
+import org.sonar.java.ast.visitors.SubscriptionVisitor;
 import org.sonar.plugins.java.api.IssuableSubscriptionVisitor;
 import org.sonar.plugins.java.api.JavaFileScanner;
 import org.sonar.plugins.java.api.JavaFileScannerContext;
 import org.sonar.plugins.java.api.tree.CompilationUnitTree;
+import org.sonar.plugins.java.api.tree.SyntaxToken;
+import org.sonar.plugins.java.api.tree.SyntaxTrivia;
 import org.sonar.plugins.java.api.tree.Tree;
 import org.sonar.plugins.java.api.tree.Tree.Kind;
 
@@ -59,20 +64,6 @@ public class VisitorsBridgeTest {
   private static final CompilationUnitTree COMPILATION_UNIT_TREE = JParserTestUtils.parse(FILE);
 
   private static final NullPointerException NPE = new NullPointerException("BimBadaboum");
-  private static final JavaFileScanner VISITOR_JAVA_FILE_SCANNER_NPE = c -> {
-    throw NPE;
-  };
-  private static final JavaFileScanner VISITOR_SUBSCRIPTION_NPE = new IssuableSubscriptionVisitor() {
-    @Override
-    public List<Tree.Kind> nodesToVisit() {
-      return Collections.singletonList(Tree.Kind.CLASS);
-    }
-
-    @Override
-    public void visitNode(Tree tree) {
-      throw NPE;
-    }
-  };
 
   @Test
   @Ignore
@@ -139,7 +130,7 @@ public class VisitorsBridgeTest {
   @Test
   public void rethrow_exception_when_hidden_property_set_to_true_with_JavaFileScanner_visitors() {
     try {
-      visitorsBridge(VISITOR_JAVA_FILE_SCANNER_NPE, true)
+      visitorsBridge(new JFS_ThrowingNPEJavaFileScanner(), true)
         .visitFile(COMPILATION_UNIT_TREE);
       Fail.fail("scanning of file should have raise an exception");
     } catch (Exception e) {
@@ -151,19 +142,21 @@ public class VisitorsBridgeTest {
   @Test
   public void swallow_exception_when_hidden_property_set_to_false_with_JavaFileScanner_visitors() {
     try {
-      visitorsBridge(VISITOR_JAVA_FILE_SCANNER_NPE, false)
+      visitorsBridge(new JFS_ThrowingNPEJavaFileScanner(), false)
         .visitFile(COMPILATION_UNIT_TREE);
     } catch (Exception e) {
       e.printStackTrace();
       Fail.fail("Exception should be swallowed when property is not set");
     }
     assertThat(sonarComponents.analysisErrors).hasSize(1);
+    assertThat(logTester.logs(LoggerLevel.ERROR)).hasSameSizeAs(sonarComponents.analysisErrors);
+    assertThat(logTester.logs(LoggerLevel.ERROR).stream().map(VisitorsBridgeTest::ruleKeyFromErrorLog)).containsExactlyInAnyOrder("JFS");
   }
 
   @Test
   public void rethrow_exception_when_hidden_property_set_to_true_with_Subscription_visitors() {
     try {
-      visitorsBridge(VISITOR_SUBSCRIPTION_NPE, true)
+      visitorsBridge(new SV1_ThrowingNPEVisitingClass(), true)
         .visitFile(COMPILATION_UNIT_TREE);
       Fail.fail("scanning of file should have raise an exception");
     } catch (Exception e) {
@@ -175,25 +168,104 @@ public class VisitorsBridgeTest {
   @Test
   public void swallow_exception_when_hidden_property_set_to_false_with_Subscription_visitors() {
     try {
-      visitorsBridge(VISITOR_SUBSCRIPTION_NPE, false)
+      visitorsBridge(Arrays.asList(
+        new SV1_ThrowingNPEVisitingClass(),
+        new SV2_ThrowingNPELeavingClass(),
+        new SV4_ThrowingNPEVisitingTrivia(),
+        new SV3_ThrowingNPEVisitingToken()),
+        false)
         .visitFile(COMPILATION_UNIT_TREE);
     } catch (Exception e) {
       e.printStackTrace();
-      Fail.fail("Exception should be swallowed when property is not set");
+      Fail.fail("Exceptions should be swallowed when property is not set");
     }
-    assertThat(sonarComponents.analysisErrors).hasSize(1);
+    assertThat(sonarComponents.analysisErrors).hasSize(4);
+    assertThat(logTester.logs(LoggerLevel.ERROR)).hasSameSizeAs(sonarComponents.analysisErrors);
+    assertThat(logTester.logs(LoggerLevel.ERROR).stream().map(VisitorsBridgeTest::ruleKeyFromErrorLog)).containsExactlyInAnyOrder("SV1", "SV2", "SV3", "SV4");
+  }
+
+  private static String ruleKeyFromErrorLog(String errorLog) {
+    int onFileIndex = errorLog.indexOf(" on file");
+    return errorLog.substring(onFileIndex - 3, onFileIndex);
   }
 
   private final VisitorsBridge visitorsBridge(JavaFileScanner visitor, boolean failOnException) {
+    return visitorsBridge(Collections.singletonList(visitor), failOnException);
+  }
+
+  private final VisitorsBridge visitorsBridge(Collection<JavaFileScanner> visitors, boolean failOnException) {
     SensorContextTester sensorContextTester = SensorContextTester.create(new File(""));
     sensorContextTester.setSettings(new MapSettings().setProperty(SonarComponents.FAIL_ON_EXCEPTION_KEY, failOnException));
 
     sonarComponents = new SonarComponents(null, null, null, null, null);
     sonarComponents.setSensorContext(sensorContextTester);
 
-    VisitorsBridge visitorsBridge = new VisitorsBridge(Collections.singleton(visitor), new ArrayList<>(), sonarComponents);
+    VisitorsBridge visitorsBridge = new VisitorsBridge(visitors, new ArrayList<>(), sonarComponents);
     visitorsBridge.setCurrentFile(INPUT_FILE);
 
     return visitorsBridge;
+  }
+
+  @org.sonar.check.Rule(key = "JFS")
+  private static class JFS_ThrowingNPEJavaFileScanner implements JavaFileScanner {
+    @Override
+    public void scanFile(JavaFileScannerContext context) {
+      throw NPE;
+    }
+  }
+
+  @org.sonar.check.Rule(key = "SV1")
+  private static class SV1_ThrowingNPEVisitingClass extends SubscriptionVisitor {
+    @Override
+    public List<Tree.Kind> nodesToVisit() {
+      return Collections.singletonList(Tree.Kind.CLASS);
+    }
+
+    @Override
+    public void visitNode(Tree tree) {
+      throw NPE;
+    }
+  }
+
+  @org.sonar.check.Rule(key = "SV2")
+  private static class SV2_ThrowingNPELeavingClass extends SubscriptionVisitor {
+    @Override
+    public List<Tree.Kind> nodesToVisit() {
+      return Collections.singletonList(Tree.Kind.CLASS);
+    }
+
+    @Override
+    public void leaveNode(Tree tree) {
+      throw NPE;
+    }
+  }
+
+  @org.sonar.check.Rule(key = "SV3")
+  private static class SV3_ThrowingNPEVisitingToken extends SubscriptionVisitor {
+    @Override
+    public List<Tree.Kind> nodesToVisit() {
+      return Collections.singletonList(Tree.Kind.TOKEN);
+    }
+
+    @Override
+    public void visitToken(SyntaxToken syntaxToken) {
+      if ("{".equals(syntaxToken.text())) {
+        // so it only throws once and not on every token
+        throw NPE;
+      }
+    }
+  }
+
+  @org.sonar.check.Rule(key = "SV4")
+  private static class SV4_ThrowingNPEVisitingTrivia extends SubscriptionVisitor {
+    @Override
+    public List<Tree.Kind> nodesToVisit() {
+      return Collections.singletonList(Tree.Kind.TRIVIA);
+    }
+
+    @Override
+    public void visitTrivia(SyntaxTrivia syntaxTrivia) {
+      throw NPE;
+    }
   }
 }
