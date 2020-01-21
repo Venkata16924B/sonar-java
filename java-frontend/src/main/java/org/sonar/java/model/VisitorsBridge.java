@@ -133,7 +133,9 @@ public class VisitorsBridge {
       runScanner(javaFileScannerContext, new SymbolicExecutionVisitor(executableScanners, behaviorCache), AnalysisError.Kind.SE_ERROR);
       behaviorCache.cleanup();
     }
-    executableScanners.forEach(scanner -> runScanner(javaFileScannerContext, scanner, AnalysisError.Kind.CHECK_ERROR));
+    for (JavaFileScanner scanner : executableScanners) {
+      runScanner(javaFileScannerContext, scanner, AnalysisError.Kind.CHECK_ERROR);
+    }
     scannerRunner.run(javaFileScannerContext);
   }
 
